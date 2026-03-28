@@ -308,6 +308,24 @@ def init_clob_client():
     return client
 
 
+def fetch_live_bankroll(client):
+    """
+    Fetch actual USDC balance from Polymarket.
+
+    Returns balance in dollars (float) or None on error.
+    """
+    try:
+        from py_clob_client.clob_types import BalanceAllowanceParams
+        params = BalanceAllowanceParams(asset_type="COLLATERAL", signature_type=1)
+        result = client.get_balance_allowance(params)
+        raw = int(result.get("balance", 0))
+        balance = raw / 1_000_000  # USDC has 6 decimals
+        return balance
+    except Exception as e:
+        log_event("balance_fetch_error", {"error": str(e)})
+        return None
+
+
 def run_window(client, config, bankroll, dry_run=False):
     """
     Execute one 5-minute trading window.
@@ -529,13 +547,34 @@ def main():
 
     mode = args.mode or os.getenv("BOT_MODE", "safe")
     config = MODE_CONFIGS[mode]
-    bankroll = args.bankroll or float(os.getenv("STARTING_BANKROLL", "1.0"))
+
+    # Initialize CLOB client
+    client = None
+    if not args.dry_run:
+        client = init_clob_client()
+        log_event("client_initialized", {"mode": mode})
+    else:
+        log_event("dry_run_mode", {"mode": mode})
+
+    # Auto-fetch live balance if no --bankroll override
+    if args.bankroll:
+        bankroll = args.bankroll
+    elif client:
+        live_balance = fetch_live_bankroll(client)
+        if live_balance is not None:
+            bankroll = live_balance
+            log_event("live_balance_fetched", {"balance": bankroll})
+        else:
+            bankroll = float(os.getenv("STARTING_BANKROLL", "1.0"))
+            log_event("balance_fallback", {"bankroll": bankroll})
+    else:
+        bankroll = float(os.getenv("STARTING_BANKROLL", "1.0"))
 
     print("=" * 60)
     print("  POLYMARKET BTC 5-MIN TRADING BOT")
     print("=" * 60)
     print(f"  Mode:       {mode}")
-    print(f"  Bankroll:   ${bankroll:.2f}")
+    print(f"  Bankroll:   ${bankroll:.2f} (live balance)")
     print(f"  Dry run:    {args.dry_run}")
     print(f"  Min bet:    ${config['min_bet']:.2f}")
     print(f"  Max bet:    ${config['max_bet']:.2f}")
@@ -543,14 +582,6 @@ def main():
     print(f"  Min score:  {config['min_score']:.1f}")
     print(f"  Entry delay:{config['entry_delay_s']}s")
     print("=" * 60)
-
-    # Initialize CLOB client (skip for dry-run if no creds)
-    client = None
-    if not args.dry_run:
-        client = init_clob_client()
-        log_event("client_initialized", {"mode": mode})
-    else:
-        log_event("dry_run_mode", {"mode": mode})
 
     # Trading loop
     trade_count = 0
