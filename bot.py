@@ -77,13 +77,13 @@ LOG_FILE = "bot_log.jsonl"
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 def log_event(event_type, data):
-    """Append a JSON log line."""
+    """Append a JSON log line. Flushes stdout for Railway/Docker log capture."""
     entry = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "event": event_type,
         **data,
     }
-    print(f"[{entry['ts']}] {event_type}: {json.dumps(data, default=str)}")
+    print(f"[{entry['ts']}] {event_type}: {json.dumps(data, default=str)}", flush=True)
     try:
         with open(LOG_FILE, "a") as f:
             f.write(json.dumps(entry, default=str) + "\n")
@@ -570,16 +570,16 @@ def main():
     else:
         bankroll = float(os.getenv("STARTING_BANKROLL", "1.0"))
 
-    print("=" * 60)
-    print("  POLYMARKET BTC 5-MIN TRADING BOT")
-    print("=" * 60)
-    print(f"  Mode:       {mode}")
-    print(f"  Bankroll:   ${bankroll:.2f} (live balance)")
-    print(f"  Dry run:    {args.dry_run}")
-    print(f"  Min bet:    ${config['min_bet']:.2f}")
-    print(f"  Max bet:    ${config['max_bet']:.2f}")
-    print(f"  Conf thres: {config['confidence_threshold']:.2f}")
-    print(f"  Min score:  {config['min_score']:.1f}")
+    print("=" * 60, flush=True)
+    print("  POLYMARKET BTC 5-MIN TRADING BOT", flush=True)
+    print("=" * 60, flush=True)
+    print(f"  Mode:       {mode}", flush=True)
+    print(f"  Bankroll:   ${bankroll:.2f} (live balance)", flush=True)
+    print(f"  Dry run:    {args.dry_run}", flush=True)
+    print(f"  Min bet:    ${config['min_bet']:.2f}", flush=True)
+    print(f"  Max bet:    ${config['max_bet']:.2f}", flush=True)
+    print(f"  Conf thres: {config['confidence_threshold']:.2f}", flush=True)
+    print(f"  Min score:  {config['min_score']:.1f}", flush=True)
     print(f"  Entry delay:{config['entry_delay_s']}s")
     print("=" * 60)
 
