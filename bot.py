@@ -253,12 +253,14 @@ def place_order(client, token_id, side, amount, price, dry_run=False):
 
     try:
         from py_clob_client.order_builder.constants import BUY
-        order_args = {
-            "token_id": token_id,
-            "price": price,
-            "size": amount,
-            "side": BUY,
-        }
+        from py_clob_client.clob_types import OrderArgs, OrderType
+
+        order_args = OrderArgs(
+            price=price,
+            size=amount,
+            side=BUY,
+            token_id=token_id,
+        )
         signed_order = client.create_order(order_args)
         result = client.post_order(signed_order)
         log_event("order_placed", {"result": str(result)})
