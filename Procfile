@@ -1,1 +1,1 @@
-worker: python bot.py --mode safe
+worker: python bot.py --mode normal
