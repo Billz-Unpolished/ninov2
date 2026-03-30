@@ -32,6 +32,7 @@ from dotenv import load_dotenv
 
 from strategy import analyze, fetch_candles, fetch_current_price
 from backtest import estimate_token_price
+from storage import insert_event
 
 load_dotenv()
 
@@ -87,6 +88,10 @@ def log_event(event_type, data):
     try:
         with open(LOG_FILE, "a") as f:
             f.write(json.dumps(entry, default=str) + "\n")
+    except Exception:
+        pass
+    try:
+        insert_event(entry)
     except Exception:
         pass
 
