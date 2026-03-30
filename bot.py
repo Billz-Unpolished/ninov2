@@ -1,22 +1,14 @@
 """
 bot.py — Main Polymarket BTC 5-minute Up/Down Trading Bot.
 
-Lifecycle per 5-min window:
-  1. Detect next window open (epoch % 300 == 0)
-  2. Record window_open_price from Binance
-  3. Poll BTC price every 2s, accumulate tick data
-  4. At T+180s (configurable), run strategy.analyze()
-  5. If confidence >= threshold, place order via CLOB
-  6. Wait for window close, log outcome
-  7. Repeat
-
-Modes:
-  - safe:   min_bet=$1, requires confidence >= 0.60
-  - normal: standard Kelly sizing, confidence >= 0.40
-  - degen:  aggressive Kelly, confidence >= 0.25
-
-Usage:
-    python bot.py [--mode safe] [--dry-run] [--once]
+Live behavior follows a late snipe model:
+  1. Wait for the next 5-minute BTC window to open
+  2. Record the opening BTC price and active Polymarket market
+  3. Poll BTC every 2s through the full window
+  4. Starting at T-10s, run repeated TA checks every 2s
+  5. Track the strongest signal and fire on spike/confidence/deadline
+  6. Place a FOK buy, retrying until close, then fall back to GTC at $0.95
+  7. Wait for close, score the outcome, and update bankroll
 """
 
 import argparse
@@ -40,28 +32,40 @@ load_dotenv()
 
 MODE_CONFIGS = {
     "safe": {
+        "display_name": "safe",
         "min_bet": 1.0,
-        "max_bet": 5.0,
-        "confidence_threshold": 0.60,
-        "min_score": 3.0,
-        "kelly_fraction": 0.10,
-        "entry_delay_s": 200,  # wait longer for more data
+        "confidence_threshold": 0.30,
+        "bet_style": "fractional",
+        "bankroll_fraction": 0.25,
+        "snipe_start_s": 10,
+        "hard_deadline_s": 5,
+    },
+    "aggressive": {
+        "display_name": "aggressive",
+        "min_bet": 1.0,
+        "confidence_threshold": 0.20,
+        "bet_style": "profits_only",
+        "bankroll_fraction": 1.0,
+        "snipe_start_s": 10,
+        "hard_deadline_s": 5,
     },
     "normal": {
+        "display_name": "aggressive",
         "min_bet": 1.0,
-        "max_bet": 20.0,
-        "confidence_threshold": 0.40,
-        "min_score": 2.0,
-        "kelly_fraction": 0.25,
-        "entry_delay_s": 180,
+        "confidence_threshold": 0.20,
+        "bet_style": "profits_only",
+        "bankroll_fraction": 1.0,
+        "snipe_start_s": 10,
+        "hard_deadline_s": 5,
     },
     "degen": {
+        "display_name": "degen",
         "min_bet": 1.0,
-        "max_bet": 50.0,
-        "confidence_threshold": 0.25,
-        "min_score": 1.5,
-        "kelly_fraction": 0.50,
-        "entry_delay_s": 150,
+        "confidence_threshold": 0.0,
+        "bet_style": "all_in",
+        "bankroll_fraction": 1.0,
+        "snipe_start_s": 10,
+        "hard_deadline_s": 5,
     },
 }
 
@@ -111,27 +115,37 @@ def wait_until(target_ts):
         time.sleep(min(remaining, 1.0))
 
 
-def kelly_bet_size(bankroll, confidence, token_price, config):
-    """
-    Half-Kelly sizing.
+def calculate_bet_size(bankroll, starting_bankroll, config):
+    """Mode-based bet sizing from the build guide."""
+    style = config["bet_style"]
 
-    For a binary market paying $1:
-      Edge = confidence - token_price
-      Kelly fraction = edge / (1 - token_price)  [simplified for binary]
-      Bet = bankroll * kelly_fraction * config_fraction
-    """
-    edge = confidence - token_price
-    if edge <= 0:
-        return 0
+    if style == "fractional":
+        amount = bankroll * config["bankroll_fraction"]
+    elif style == "profits_only":
+        amount = bankroll if bankroll <= starting_bankroll else (bankroll - starting_bankroll)
+    elif style == "all_in":
+        amount = bankroll
+    else:
+        amount = config["min_bet"]
 
-    odds_fraction = 1 - token_price
-    if odds_fraction <= 0:
-        return 0
+    amount = min(amount, bankroll)
+    if bankroll >= config["min_bet"]:
+        amount = max(amount, config["min_bet"])
+    return round(max(amount, 0), 2)
 
-    kelly = edge / odds_fraction
-    raw_bet = bankroll * kelly * config["kelly_fraction"]
-    bet = max(config["min_bet"], min(raw_bet, config["max_bet"], bankroll * 0.5))
-    return round(bet, 2)
+
+def resolve_mode(mode):
+    """Map legacy mode names onto the canonical config."""
+    if mode == "normal":
+        return "aggressive"
+    return mode
+
+
+def choose_fallback_direction(window_open_price, current_price):
+    """Never skip a trade at the hard deadline."""
+    if current_price is None or window_open_price is None:
+        return "UP"
+    return "UP" if current_price >= window_open_price else "DOWN"
 
 
 # ─── Midpoint Pricing ──────────────────────────────────────────────────────
@@ -239,7 +253,7 @@ def find_btc_5min_market(window_ts):
 
 # ─── Order Placement ─────────────────────────────────────────────────────────
 
-def place_order(client, token_id, side, amount, price, dry_run=False):
+def place_order(client, token_id, side, amount, price, dry_run=False, order_type="GTC"):
     """
     Place a limit order on Polymarket CLOB.
 
@@ -254,25 +268,86 @@ def place_order(client, token_id, side, amount, price, dry_run=False):
             "amount": amount,
             "price": price,
         })
-        return {"dry_run": True, "status": "simulated"}
+        return {"dry_run": True, "status": "simulated", "order_type": order_type}
 
     try:
         from py_clob_client.order_builder.constants import BUY
-        from py_clob_client.clob_types import OrderArgs, OrderType
+        from py_clob_client.clob_types import OrderArgs
 
         order_args = OrderArgs(
+            token_id=token_id,
             price=price,
             size=amount,
             side=BUY,
-            token_id=token_id,
         )
         signed_order = client.create_order(order_args)
-        result = client.post_order(signed_order)
-        log_event("order_placed", {"result": str(result)})
+        result = client.post_order(signed_order, orderType=order_type)
+        log_event("order_placed", {"result": str(result), "order_type": order_type, "price": price})
         return result
     except Exception as e:
         log_event("order_error", {"error": str(e), "traceback": traceback.format_exc()})
         return None
+
+
+def execute_order_until_close(client, token_id, amount_dollars, fallback_price, window_end_ts, dry_run=False):
+    """
+    Retry FOK buys every 3s until close, then fall back to a GTC bid at $0.95.
+    """
+    from py_clob_client.clob_types import OrderType
+
+    if dry_run:
+        shares = round(amount_dollars / max(fallback_price, 0.01), 2)
+        return {
+            "status": "dry_run",
+            "order_type": "SIMULATED",
+            "price": fallback_price,
+            "shares": shares,
+        }
+
+    while time.time() < window_end_ts:
+        live_price = fallback_price
+        midpoint = fetch_midpoint(token_id)
+        if midpoint:
+            live_price = midpoint
+        shares = round(amount_dollars / max(live_price, 0.01), 2)
+        result = place_order(
+            client,
+            token_id,
+            "BUY",
+            shares,
+            round(min(max(live_price, 0.01), 0.99), 3),
+            dry_run=False,
+            order_type=OrderType.FOK,
+        )
+        if result:
+            return {
+                "status": "filled",
+                "order_type": "FOK",
+                "price": round(min(max(live_price, 0.01), 0.99), 3),
+                "shares": shares,
+                "result": result,
+            }
+        time.sleep(3)
+
+    limit_price = 0.95
+    min_shares = 5.0
+    shares = round(max(amount_dollars / limit_price, min_shares), 2)
+    result = place_order(
+        client,
+        token_id,
+        "BUY",
+        shares,
+        limit_price,
+        dry_run=False,
+        order_type=OrderType.GTC,
+    )
+    return {
+        "status": "posted_fallback",
+        "order_type": "GTC",
+        "price": limit_price,
+        "shares": shares,
+        "result": result,
+    }
 
 
 # ─── Main Loop ───────────────────────────────────────────────────────────────
@@ -333,7 +408,7 @@ def fetch_live_bankroll(client):
         return None
 
 
-def run_window(client, config, bankroll, dry_run=False):
+def run_window(client, config, bankroll, starting_bankroll, mode_name, dry_run=False):
     """
     Execute one 5-minute trading window.
 
@@ -370,10 +445,11 @@ def run_window(client, config, bankroll, dry_run=False):
     # Poll BTC prices every 2s + token midpoints every 10s
     tick_prices = []
     midpoint_history = []  # [(timestamp, up_mid, down_mid)]
-    entry_time = window_ts + config["entry_delay_s"]
+    snipe_start_ts = window_end_ts - config["snipe_start_s"]
+    hard_deadline_ts = window_end_ts - config["hard_deadline_s"]
     last_midpoint_poll = 0
 
-    while time.time() < entry_time:
+    while time.time() < snipe_start_ts:
         price = fetch_current_price()
         if price:
             tick_prices.append((time.time(), price))
@@ -393,46 +469,13 @@ def run_window(client, config, bankroll, dry_run=False):
 
         time.sleep(2)
 
-    # Fetch candles and run strategy
-    candles = fetch_candles(limit=30)
-    current_price = fetch_current_price() or (tick_prices[-1][1] if tick_prices else None)
-
-    if current_price is None:
-        log_event("error", {"msg": "Could not fetch current price at entry time"})
-        return bankroll, None
-
-    score, confidence, details = analyze(
-        candles=candles,
-        window_open_price=window_open_price,
-        current_price=current_price,
-        tick_prices=tick_prices,
-    )
-
-    direction = "UP" if score > 0 else ("DOWN" if score < 0 else "SKIP")
-
-    log_event("analysis", {
-        "score": score,
-        "confidence": confidence,
-        "direction": direction,
-        "current_price": current_price,
-        "delta_pct": round((current_price - window_open_price) / window_open_price * 100, 6),
-        "details": details,
-    })
-
-    # Decision: bet or skip?
-    should_bet = (
-        abs(score) >= config["min_score"]
-        and confidence >= config["confidence_threshold"]
-        and direction != "SKIP"
-    )
-
     trade_record = {
         "window_ts": window_ts,
         "open_price": window_open_price,
-        "entry_price": current_price,
-        "score": score,
-        "confidence": confidence,
-        "direction": direction,
+        "entry_price": None,
+        "score": 0,
+        "confidence": 0,
+        "direction": None,
         "bet": False,
         "amount": 0,
         "token_cost": 0,
@@ -440,68 +483,162 @@ def run_window(client, config, bankroll, dry_run=False):
         "outcome": None,
     }
 
-    if not should_bet:
-        log_event("skip", {"reason": "below threshold", "score": score, "confidence": confidence})
-        # Still wait for window end to log outcome
-        wait_until(window_end_ts + 5)
-        close_price = fetch_current_price()
-        if close_price:
-            actual = "UP" if close_price >= window_open_price else "DOWN"
-            trade_record["outcome"] = actual
-            log_event("window_close_skip", {"actual": actual, "close_price": close_price})
-        return bankroll, trade_record
+    best_signal = None
+    prev_score = None
+    trigger_reason = None
 
-    # Fetch LIVE midpoint price from Polymarket orderbook
-    token_price = None
-    if market_info:
-        condition_id, token_up, token_down = market_info
+    while time.time() < window_end_ts:
+        loop_ts = time.time()
+        current_price = fetch_current_price() or (tick_prices[-1][1] if tick_prices else None)
+        if current_price is not None:
+            tick_prices.append((loop_ts, current_price))
+
+        if market_info and loop_ts - last_midpoint_poll >= 10:
+            _, token_up, token_down = market_info
+            up_mid, down_mid = fetch_both_midpoints(token_up, token_down)
+            if up_mid is not None and down_mid is not None:
+                midpoint_history.append((loop_ts, up_mid, down_mid))
+                log_event("midpoint_poll", {
+                    "up": up_mid,
+                    "down": down_mid,
+                    "elapsed": round(loop_ts - window_ts, 1),
+                })
+            last_midpoint_poll = loop_ts
+
+        candles = fetch_candles(limit=30)
+        score, confidence, details = analyze(
+            candles=candles,
+            window_open_price=window_open_price,
+            current_price=current_price,
+            tick_prices=tick_prices,
+        )
+        direction = "UP" if score > 0 else ("DOWN" if score < 0 else "SKIP")
+        signal = {
+            "score": score,
+            "confidence": confidence,
+            "direction": direction,
+            "current_price": current_price,
+            "details": details,
+            "checked_at": loop_ts,
+        }
+        if direction != "SKIP" and (best_signal is None or abs(score) > abs(best_signal["score"])):
+            best_signal = signal
+
+        log_event("analysis_check", {
+            "window_ts": window_ts,
+            "score": score,
+            "confidence": confidence,
+            "direction": direction,
+            "current_price": current_price,
+            "delta_pct": round((current_price - window_open_price) / window_open_price * 100, 6) if current_price else None,
+        })
+
+        score_jump = abs(score - prev_score) if prev_score is not None else 0
+        prev_score = score
+
+        if direction != "SKIP" and score_jump >= 1.5:
+            trigger_reason = "score_spike"
+            best_signal = signal
+            break
+        if direction != "SKIP" and confidence >= config["confidence_threshold"]:
+            trigger_reason = "confidence_met"
+            best_signal = signal
+            break
+        if loop_ts >= hard_deadline_ts:
+            trigger_reason = "hard_deadline"
+            break
+        time.sleep(2)
+
+    chosen_signal = best_signal
+    if chosen_signal is None:
+        current_price = fetch_current_price() or (tick_prices[-1][1] if tick_prices else None) or window_open_price
+        chosen_signal = {
+            "score": 0.0,
+            "confidence": 0.0,
+            "direction": choose_fallback_direction(window_open_price, current_price),
+            "current_price": current_price,
+            "details": {"fallback": True},
+        }
+    elif trigger_reason == "hard_deadline" and best_signal is None:
+        chosen_signal["direction"] = choose_fallback_direction(window_open_price, chosen_signal["current_price"])
+
+    direction = chosen_signal["direction"]
+    score = chosen_signal["score"]
+    confidence = chosen_signal["confidence"]
+    current_price = chosen_signal["current_price"]
+    details = chosen_signal["details"]
+
+    trade_record["entry_price"] = current_price
+    trade_record["score"] = score
+    trade_record["confidence"] = confidence
+    trade_record["direction"] = direction
+
+    log_event("analysis", {
+        "window_ts": window_ts,
+        "score": score,
+        "confidence": confidence,
+        "direction": direction,
+        "trigger_reason": trigger_reason or "best_signal",
+        "current_price": current_price,
+        "delta_pct": round((current_price - window_open_price) / window_open_price * 100, 6) if current_price else None,
+        "details": details,
+    })
+
+    token_price = estimate_token_price(window_open_price, current_price)
+    if not dry_run and market_info:
+        _, token_up, token_down = market_info
         target_token = token_up if direction == "UP" else token_down
-        token_price = fetch_midpoint(target_token)
-        if token_price:
+        live_mid = fetch_midpoint(target_token)
+        if live_mid:
+            token_price = live_mid
             log_event("live_midpoint", {
+                "window_ts": window_ts,
                 "direction": direction,
                 "midpoint": token_price,
             })
+        else:
+            log_event("midpoint_fallback", {"window_ts": window_ts, "estimated_price": token_price})
+    else:
+        log_event("pricing_model", {"window_ts": window_ts, "estimated_price": token_price})
 
-    # Fallback to estimated price if midpoint unavailable
-    if token_price is None or token_price <= 0:
-        token_price = estimate_token_price(window_open_price, current_price)
-        log_event("midpoint_fallback", {"estimated_price": token_price})
-
-    bet_amount = kelly_bet_size(bankroll, confidence, token_price, config)
-
-    if bet_amount < config["min_bet"]:
-        log_event("skip", {"reason": "bet too small", "calculated": bet_amount})
-        wait_until(window_end_ts + 5)
-        close_price = fetch_current_price()
-        if close_price:
-            trade_record["outcome"] = "UP" if close_price >= window_open_price else "DOWN"
-        return bankroll, trade_record
+    bet_amount = calculate_bet_size(bankroll, starting_bankroll, config)
+    if bankroll < config["min_bet"]:
+        log_event("bankroll_reset", {
+            "window_ts": window_ts,
+            "previous_bankroll": bankroll,
+            "reset_to": starting_bankroll,
+            "reason": "below_min_bet",
+        })
+        bankroll = starting_bankroll
+        bet_amount = calculate_bet_size(bankroll, starting_bankroll, config)
 
     trade_record["bet"] = True
     trade_record["amount"] = bet_amount
     trade_record["token_cost"] = token_price
 
     log_event("placing_bet", {
+        "window_ts": window_ts,
+        "mode": mode_name,
         "direction": direction,
         "amount": bet_amount,
         "token_price": token_price,
         "bankroll_before": bankroll,
     })
 
-    # Place the order
-    if market_info and not dry_run:
-        condition_id, token_up, token_down = market_info
+    if market_info:
+        _, token_up, token_down = market_info
         token_id = token_up if direction == "UP" else token_down
-        shares = round(bet_amount / token_price, 2)
-        result = place_order(client, token_id, "BUY", shares, token_price, dry_run=dry_run)
-        log_event("order_result", {"result": str(result)})
+        result = execute_order_until_close(
+            client,
+            token_id,
+            bet_amount,
+            token_price,
+            window_end_ts,
+            dry_run=dry_run or client is None,
+        )
+        log_event("order_result", {"window_ts": window_ts, "result": str(result)})
     else:
-        log_event("dry_run_bet", {
-            "direction": direction,
-            "amount": bet_amount,
-            "token_price": token_price,
-        })
+        log_event("order_skip", {"window_ts": window_ts, "reason": "market_not_found"})
 
     # Wait for window close
     wait_until(window_end_ts + 5)
@@ -542,17 +679,19 @@ def run_window(client, config, bankroll, dry_run=False):
 
 def main():
     parser = argparse.ArgumentParser(description="Polymarket BTC 5-min Trading Bot")
-    parser.add_argument("--mode", choices=["safe", "normal", "degen"], default=None,
+    parser.add_argument("--mode", choices=["safe", "aggressive", "normal", "degen"], default=None,
                         help="Trading mode (overrides BOT_MODE env var)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Run without placing real orders")
     parser.add_argument("--once", action="store_true",
                         help="Run one window then exit")
+    parser.add_argument("--max-trades", type=int, default=None,
+                        help="Stop after N windows")
     parser.add_argument("--bankroll", type=float, default=None,
                         help="Starting bankroll (overrides STARTING_BANKROLL env var)")
     args = parser.parse_args()
 
-    mode = args.mode or os.getenv("BOT_MODE", "safe")
+    mode = resolve_mode(args.mode or os.getenv("BOT_MODE", "safe"))
     config = MODE_CONFIGS[mode]
 
     # Initialize CLOB client
@@ -576,18 +715,18 @@ def main():
             log_event("balance_fallback", {"bankroll": bankroll})
     else:
         bankroll = float(os.getenv("STARTING_BANKROLL", "1.0"))
+    starting_bankroll = bankroll
 
     print("=" * 60, flush=True)
     print("  POLYMARKET BTC 5-MIN TRADING BOT", flush=True)
     print("=" * 60, flush=True)
-    print(f"  Mode:       {mode}", flush=True)
+    print(f"  Mode:       {config['display_name']}", flush=True)
     print(f"  Bankroll:   ${bankroll:.2f} (live balance)", flush=True)
     print(f"  Dry run:    {args.dry_run}", flush=True)
     print(f"  Min bet:    ${config['min_bet']:.2f}", flush=True)
-    print(f"  Max bet:    ${config['max_bet']:.2f}", flush=True)
     print(f"  Conf thres: {config['confidence_threshold']:.2f}", flush=True)
-    print(f"  Min score:  {config['min_score']:.1f}", flush=True)
-    print(f"  Entry delay:{config['entry_delay_s']}s")
+    print(f"  Bet style:  {config['bet_style']}", flush=True)
+    print(f"  Snipe at:   T-{config['snipe_start_s']}s to T-{config['hard_deadline_s']}s")
     print("=" * 60)
 
     # Trading loop
@@ -597,7 +736,14 @@ def main():
 
     try:
         while True:
-            bankroll, trade = run_window(client, config, bankroll, dry_run=args.dry_run)
+            bankroll, trade = run_window(
+                client,
+                config,
+                bankroll,
+                starting_bankroll,
+                mode,
+                dry_run=args.dry_run,
+            )
 
             if trade:
                 trade_count += 1
@@ -621,6 +767,9 @@ def main():
 
             if args.once:
                 print("\n--once flag set. Exiting after one window.")
+                break
+            if args.max_trades and trade_count >= args.max_trades:
+                print(f"\n--max-trades limit ({args.max_trades}) reached. Exiting.")
                 break
 
     except KeyboardInterrupt:

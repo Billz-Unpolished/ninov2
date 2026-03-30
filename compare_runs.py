@@ -18,12 +18,8 @@ from backtest import (
     group_into_windows,
     estimate_token_price,
     fetch_polymarket_history,
-    get_real_token_price,
 )
 from strategy import analyze
-
-# Real token price from Polymarket orderbook observation
-REAL_TOKEN_COST = get_real_token_price()  # $0.505
 
 try:
     from openpyxl import Workbook
@@ -34,7 +30,7 @@ except ImportError:
     HAS_OPENPYXL = False
 
 
-def run_backtest(windows, bet_amount=1.0, confidence_threshold=0.40, min_score=2.0,
+def run_backtest(windows, bet_amount=1.0, confidence_threshold=0.30, min_score=0.0,
                   poly_lookup=None):
     """
     Simulate the bot's strategy on historical 5-min windows.
@@ -58,8 +54,9 @@ def run_backtest(windows, bet_amount=1.0, confidence_threshold=0.40, min_score=2
         if len(wc) < 3:
             continue
 
-        # Simulate: bot sees first ~3 candles (entry point ~3 min in)
-        entry_idx = min(3, len(wc) - 1)
+        # Use the latest 1-minute candle as the closest historical proxy for
+        # the T-10s snipe window described by the live bot guide.
+        entry_idx = len(wc) - 1
         visible_candles = wc[:entry_idx + 1]
         window_open = w["open_price"]
         current_price = visible_candles[-1]["close"]
@@ -88,16 +85,21 @@ def run_backtest(windows, bet_amount=1.0, confidence_threshold=0.40, min_score=2
             actual = w["outcome"]
             resolution_source = "binance"
 
-        would_bet = abs(score) >= min_score and confidence >= confidence_threshold and prediction != "SKIP"
+        if prediction == "SKIP":
+            prediction = "UP" if current_price >= window_open else "DOWN"
 
-        # P&L using real token cost ($0.505)
+        would_bet = True
+        if prediction != "SKIP" and confidence < confidence_threshold and abs(score) >= min_score:
+            would_bet = True
+
+        # P&L using the spec's delta-based token pricing model.
         if would_bet:
-            token_cost = REAL_TOKEN_COST
+            token_cost = estimate_token_price(window_open, current_price)
             correct = prediction == actual
             if correct:
-                pnl = (1.0 - token_cost) * bet_amount  # win: payout $1, cost was $0.505
+                pnl = (1.0 - token_cost) * bet_amount
             else:
-                pnl = -token_cost * bet_amount  # loss: lose $0.505
+                pnl = -token_cost * bet_amount
         else:
             token_cost = 0
             pnl = 0
@@ -151,7 +153,8 @@ def print_summary(trades):
     print(f"Total P&L:            ${total_pnl:.4f}")
     print(f"Avg win:              ${avg_win:.4f}")
     print(f"Avg loss:             ${avg_loss:.4f}")
-    print(f"Token cost (real):    ${REAL_TOKEN_COST}")
+    avg_token_cost = sum(t["token_cost"] for t in bet_trades) / len(bet_trades) if bet_trades else 0
+    print(f"Avg token cost:       ${avg_token_cost:.4f}")
     print(f"Resolution source:    {poly_count} polymarket / {total - poly_count} binance")
 
     # Running bankroll
@@ -274,8 +277,8 @@ def write_excel(trades, output_path):
         ("Total P&L", f"${total_pnl:.4f}"),
         ("Avg Win", f"${sum(t['pnl'] for t in wins) / len(wins):.4f}" if wins else "$0"),
         ("Avg Loss", f"${sum(t['pnl'] for t in losses) / len(losses):.4f}" if losses else "$0"),
-        ("Token Cost (real)", f"${REAL_TOKEN_COST}"),
-        ("Profit per Win", f"${(1.0 - REAL_TOKEN_COST) / REAL_TOKEN_COST:.4f}"),
+        ("Avg Token Cost", f"${sum(t['token_cost'] for t in bet_trades) / len(bet_trades):.4f}" if bet_trades else "$0"),
+        ("Avg Profit per Win", f"${sum((1.0 - t['token_cost']) for t in wins) / len(wins):.4f}" if wins else "$0"),
         ("Polymarket verified", f"{poly_verified}/{len(trades)}"),
     ]
 

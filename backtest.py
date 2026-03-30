@@ -222,25 +222,52 @@ def fetch_polymarket_history(hours=24):
     return resolved
 
 
+def _lerp(start, end, ratio):
+    """Linear interpolation helper."""
+    return start + (end - start) * ratio
+
+
 def get_real_token_price():
     """
-    Real token price based on actual Polymarket orderbook data.
+    Baseline token price for unresolved near-coinflip markets.
 
-    From live observation: tokens consistently trade at ~$0.505
-    regardless of direction until the final seconds before resolution.
+    Kept for compatibility with older code paths; real pricing should use the
+    delta-based estimate_token_price() model below.
     """
-    return 0.505
+    return 0.50
 
 
 def estimate_token_price(window_open, current_price):
     """
-    Token pricing based on real Polymarket observations.
+    Estimate token cost from the absolute move vs the window open.
 
-    Real data shows tokens trade at ~$0.505 for virtually the entire
-    window lifetime. Only in the final ~30 seconds do prices shift,
-    but by then the bot should already have its order placed.
+    Piecewise model from the bot build guide:
+      delta < 0.005% -> $0.50
+      delta ~ 0.02%  -> $0.55
+      delta ~ 0.05%  -> $0.65
+      delta ~ 0.10%  -> $0.80
+      delta ~ 0.15%+ -> $0.92-$0.97
     """
-    return 0.505
+    if not window_open or current_price is None:
+        return 0.50
+
+    delta_pct = abs(current_price - window_open) / window_open * 100
+
+    if delta_pct < 0.005:
+        price = 0.50
+    elif delta_pct < 0.02:
+        price = _lerp(0.50, 0.55, (delta_pct - 0.005) / 0.015)
+    elif delta_pct < 0.05:
+        price = _lerp(0.55, 0.65, (delta_pct - 0.02) / 0.03)
+    elif delta_pct < 0.10:
+        price = _lerp(0.65, 0.80, (delta_pct - 0.05) / 0.05)
+    elif delta_pct < 0.15:
+        price = _lerp(0.80, 0.92, (delta_pct - 0.10) / 0.05)
+    else:
+        capped = min(delta_pct, 0.25)
+        price = _lerp(0.92, 0.97, (capped - 0.15) / 0.10)
+
+    return round(min(max(price, 0.50), 0.97), 3)
 
 
 if __name__ == "__main__":
