@@ -289,6 +289,50 @@ def place_order(client, token_id, side, amount, price, dry_run=False, order_type
         return None
 
 
+def place_market_buy_order(client, token_id, amount_dollars, price, dry_run=False, order_type="FOK"):
+    """
+    Place a market-style buy using USDC amount as the primary input.
+
+    This is the correct path for FOK snipes because Polymarket enforces
+    different precision rules for maker (USDC spend) and taker (share size)
+    amounts on market buys.
+    """
+    spend = round(max(amount_dollars, 0), 2)
+    if dry_run:
+        log_event("dry_run_order", {
+            "token_id": token_id[:16] + "...",
+            "side": "BUY",
+            "amount_dollars": spend,
+            "price": price,
+            "order_type": order_type,
+        })
+        return {"dry_run": True, "status": "simulated", "order_type": order_type, "spend": spend}
+
+    try:
+        from py_clob_client.order_builder.constants import BUY
+        from py_clob_client.clob_types import MarketOrderArgs
+
+        order_args = MarketOrderArgs(
+            token_id=token_id,
+            amount=spend,
+            side=BUY,
+            price=price,
+            order_type=order_type,
+        )
+        signed_order = client.create_market_order(order_args)
+        result = client.post_order(signed_order, orderType=order_type)
+        log_event("order_placed", {
+            "result": str(result),
+            "order_type": order_type,
+            "price": price,
+            "spend": spend,
+        })
+        return result
+    except Exception as e:
+        log_event("order_error", {"error": str(e), "traceback": traceback.format_exc()})
+        return None
+
+
 def execute_order_until_close(client, token_id, amount_dollars, fallback_price, window_end_ts, dry_run=False):
     """
     Retry FOK buys every 3s until close, then fall back to a GTC bid at $0.95.
@@ -309,22 +353,24 @@ def execute_order_until_close(client, token_id, amount_dollars, fallback_price, 
         midpoint = fetch_midpoint(token_id)
         if midpoint:
             live_price = midpoint
-        shares = round(amount_dollars / max(live_price, 0.01), 2)
-        result = place_order(
+        capped_price = round(min(max(live_price, 0.01), 0.99), 3)
+        spend = round(amount_dollars, 2)
+        result = place_market_buy_order(
             client,
             token_id,
-            "BUY",
-            shares,
-            round(min(max(live_price, 0.01), 0.99), 3),
+            spend,
+            capped_price,
             dry_run=False,
             order_type=OrderType.FOK,
         )
         if result:
+            shares = round(spend / max(capped_price, 0.01), 4)
             return {
                 "status": "filled",
                 "order_type": "FOK",
-                "price": round(min(max(live_price, 0.01), 0.99), 3),
+                "price": capped_price,
                 "shares": shares,
+                "spend": spend,
                 "result": result,
             }
         time.sleep(3)
